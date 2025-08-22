@@ -1,7 +1,7 @@
 // .github/tools/reviewer.js
-// GitHub PR reviewer MVP with rate-limit aware retries, JSON-mode output,
-// repair fallback, config support, workflow_dispatch PR input, trimmed diffs,
-// and safe test/docs commits.
+// PR reviewer MVP with: JSON-mode output, repair fallback, rate-limit retries,
+// config support, safer diff positioning, and a fallback to issue comment when
+// inline review positions are rejected (422).
 
 const { Octokit } = require("@octokit/rest");
 const axios = require("axios");
@@ -20,10 +20,10 @@ let DOCS_ENABLED = true;
 const SCHEMA = z.object({
   comments: z.array(z.object({
     path: z.string(),
-    line: z.number().optional(),        // 1-based over *added* lines in the diff
-    start_line: z.number().optional(),  // (unused by this MVP, but tolerated)
+    line: z.number().optional(),        // 1-based index among *added* lines in the file diff
+    start_line: z.number().optional(),  // tolerated but unused here
     body: z.string(),
-    suggestion: z.string().optional(),  // replacement code (no fences)
+    suggestion: z.string().optional(),  // plain text code (no fences)
   })).max(100),
   tests: z.array(z.object({
     path: z.string(),
@@ -37,33 +37,33 @@ const SCHEMA = z.object({
 });
 
 // ---------- Small utils
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 function parseDurationSeconds(v) {
   if (!v) return 0;
-  if (/^\d+(\.\d+)?$/.test(v)) return Number(v); // "3" or "3.5" seconds
+  if (/^\d+(\.\d+)?$/.test(v)) return Number(v);
   const m = String(v).match(/(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?/i);
   if (!m) return 0;
   const [, h = 0, mn = 0, s = 0] = m.map(x => Number(x || 0));
   return h * 3600 + mn * 60 + s;
 }
 function waitSecondsFrom(headers, attempt) {
-  const h = n => headers?.[n] || "";
+  const h = (n) => headers?.[n] || "";
   const retryAfter = parseDurationSeconds(h("retry-after"));
-  const resetReq = parseDurationSeconds(h("x-ratelimit-reset-requests"));
-  const resetTok = parseDurationSeconds(h("x-ratelimit-reset-tokens"));
+  const resetReq   = parseDurationSeconds(h("x-ratelimit-reset-requests"));
+  const resetTok   = parseDurationSeconds(h("x-ratelimit-reset-tokens"));
   const exp = Math.min(60, 2 ** (attempt - 1)); // 1,2,4,8,16,32,60
   const jitter = Math.random();
   return Math.max(retryAfter, resetReq, resetTok, exp + jitter);
 }
 
-// ---------- OpenAI call with JSON mode + backoff + optional org header
+// ---------- OpenAI call with JSON mode + backoff (+ optional org header)
 async function openaiChat(messages, { max_tokens = 2000 } = {}) {
   const body = {
     model: MODEL,
     messages,
     temperature: TEMPERATURE,
     max_tokens,
-    response_format: { type: "json_object" }, // force valid JSON object output
+    response_format: { type: "json_object" },
   };
   const headers = {
     Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
@@ -110,7 +110,7 @@ function githubContextFromEnv() {
 
   let pull_number;
 
-  // From custom env (if you export it), or event payload
+  // Allow custom env or event payload (workflow_dispatch input)
   const prNumEnv = process.env.GITHUB_EVENT_PULL_REQUEST_NUMBER;
   if (prNumEnv) pull_number = Number(prNumEnv);
 
@@ -168,7 +168,8 @@ async function getPromptAddon(octokit, owner, repo) {
   return await getRepoTextFile(octokit, owner, repo, ".copilot-reviewer/prompt.md");
 }
 
-function trimPatch(patch) {
+// For model input only (we send a trimmed diff to stay under token budgets)
+function trimPatchForPrompt(patch) {
   if (!patch) return "";
   const filtered = patch.split("\n")
     .filter(l => l.startsWith("@@") || l.startsWith("+") || l.startsWith("-"))
@@ -176,17 +177,37 @@ function trimPatch(patch) {
   return filtered.slice(0, MAX_PATCH_CHARS);
 }
 
+// Build a mapping of nth added-line => absolute position in the unified diff
+function buildAddedLinePositions(patch) {
+  const positions = []; // positions[ (n-1) ] = diff position (1-based) of the nth '+' line
+  if (!patch) return positions;
+  let pos = 0;
+  for (const line of patch.split("\n")) {
+    pos++;
+    // Note: positions count all lines (including @@ and context); we only record when the line is an actual '+'
+    if (line.startsWith("+") && !line.startsWith("+++")) {
+      positions.push(pos);
+    }
+  }
+  return positions;
+}
+function positionFromNthAdded(patch, addedIndexOneBased) {
+  if (!patch || !addedIndexOneBased || addedIndexOneBased < 1) return undefined;
+  const arr = buildAddedLinePositions(patch);
+  return arr[addedIndexOneBased - 1]; // undefined if out of range
+}
+
 // ---------- Main
 async function main() {
   const { owner, repo, pull_number } = githubContextFromEnv();
   const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
 
-  // PR & files
+  // PR basics
   const { data: pr } = await octokit.pulls.get({ owner, repo, pull_number });
   const headSha = pr.head.sha;
   const headRef = pr.head.ref;
 
-  // Config & prompt
+  // Optional config & prompt
   const cfg = await getJSONConfig(octokit, owner, repo);
   if (cfg) {
     MODEL = cfg.model || MODEL;
@@ -199,34 +220,40 @@ async function main() {
   }
   const promptAddon = await getPromptAddon(octokit, owner, repo);
 
-  // Gather files with patches
+  // Gather changed files
   const files = [];
-  let page = 1;
-  while (true) {
+  for (let page = 1; ; page++) {
     const { data } = await octokit.pulls.listFiles({ owner, repo, pull_number, per_page: 100, page });
     files.push(...data);
     if (data.length < 100) break;
-    page++;
   }
 
-  const diffs = files
-    .filter(f => f.status !== "removed")
-    .filter(f => f.patch)
-    .filter(f => !f.filename.startsWith(".github/"))
-    .filter(f => pathMatchesAny(f.filename, TARGET_GLOBS))
-    .map(f => ({ filename: f.filename, patch: trimPatch(f.patch) }))
-    .filter(f => f.patch);
+  // Prepare diffs for the model and for positioning
+  const promptDiffs = [];
+  const patchByPath = new Map();          // full patch from GitHub for positioning
+  const addPosMapByPath = new Map();      // precomputed nth-added -> position map
 
-  if (!diffs.length) {
+  for (const f of files) {
+    if (!f.patch) continue;               // very large diffs can have null patch
+    if (f.status === "removed") continue;
+    if (f.filename.startsWith(".github/")) continue;
+    if (!pathMatchesAny(f.filename, TARGET_GLOBS)) continue;
+
+    promptDiffs.push({ filename: f.filename, patch: trimPatchForPrompt(f.patch) });
+    patchByPath.set(f.filename, f.patch);
+    addPosMapByPath.set(f.filename, buildAddedLinePositions(f.patch));
+  }
+
+  if (!promptDiffs.length) {
     console.log("No eligible diffs to review");
     return;
   }
 
-  // Light repo context
-  const readme = await getRepoTextFile(octokit, owner, repo, "README.md");
-  const pkg = await getRepoTextFile(octokit, owner, repo, "package.json");
-  const pyproj = await getRepoTextFile(octokit, owner, repo, "pyproject.toml");
-  const gomod = await getRepoTextFile(octokit, owner, repo, "go.mod");
+  // Light repo context for the model
+  const readme  = await getRepoTextFile(octokit, owner, repo, "README.md");
+  const pkg     = await getRepoTextFile(octokit, owner, repo, "package.json");
+  const pyproj  = await getRepoTextFile(octokit, owner, repo, "pyproject.toml");
+  const gomod   = await getRepoTextFile(octokit, owner, repo, "go.mod");
 
   const system = [
     "You are a meticulous senior engineer.",
@@ -251,12 +278,10 @@ async function main() {
     pyproj ? `pyproject.toml:\n${pyproj}` : "",
     gomod ? `go.mod:\n${gomod}` : "",
     "Changed files with unified diffs:",
-    ...diffs.map(d => `\n=== ${d.filename} ===\n${d.patch}`)
+    ...promptDiffs.map(d => `\n=== ${d.filename} ===\n${d.patch}`)
   ].join("\n");
 
   const extra = promptAddon ? [{ role: "system", content: promptAddon }] : [];
-
-  // Build once so we can reuse on repair attempts
   const baseMessages = [
     { role: "system", content: system },
     ...extra,
@@ -270,12 +295,10 @@ async function main() {
   try {
     parsed = SCHEMA.parse(JSON.parse(content));
   } catch (err) {
-    // Try extracting fenced JSON if present
     const fenceMatch = content.match(/```json\s*([\s\S]*?)```/i) || content.match(/```\s*([\s\S]*?)```/);
     if (fenceMatch) {
-      try { parsed = SCHEMA.parse(JSON.parse(fenceMatch[1])); } catch { /* keep repairing */ }
+      try { parsed = SCHEMA.parse(JSON.parse(fenceMatch[1])); } catch {}
     }
-
     if (!parsed) {
       console.warn("First parse failed; requesting a JSON-only reprint…", err?.message);
       const repairSystem = system + "\nReturn ONLY a valid JSON object (no code fences, no prose).";
@@ -294,59 +317,57 @@ async function main() {
   if (!DOCS_ENABLED) parsed.docs = [];
   if (parsed.comments.length > MAX_COMMENTS) parsed.comments = parsed.comments.slice(0, MAX_COMMENTS);
 
-  // Map filename -> patch for positioning
-  const filePatchMap = new Map();
-  for (const f of files) if (f.patch) filePatchMap.set(f.filename, f.patch);
-
-  function positionFromAddedLine(patch, addedLineIndexOneBased) {
-    if (!patch || !addedLineIndexOneBased) return undefined;
-    let position = 0;
-    let addedCount = 0;
-    for (const line of patch.split("\n")) {
-      position++;
-      if (line.startsWith("+++ ") || line.startsWith("--- ")) continue;
-      if (line.startsWith("@@")) continue;
-      if (line.startsWith("+") && !line.startsWith("+++")) {
-        addedCount++;
-        if (addedCount === addedLineIndexOneBased) return position;
-      }
-    }
-    return undefined;
-  }
-
-  // Build comments
-  const reviewComments = [];
-  const overflowAsIssueLines = [];
+  // Prepare review comments (try inline first)
+  const inlineComments = [];
+  const fallbackSnippets = []; // for issue comment fallback
 
   for (const c of parsed.comments) {
-    const patch = filePatchMap.get(c.path);
-    const pos = positionFromAddedLine(patch, c.line || 0);
-    const body = c.suggestion
-      ? `${c.body}\n\n\`\`\`suggestion\n${c.suggestion}\n\`\`\``
-      : c.body;
+    const path = c.path;
+    const patch = patchByPath.get(path);
+    const positionsArr = addPosMapByPath.get(path);
+    const pos = c.line ? positionFromNthAdded(patch, c.line) : undefined;
+
+    const suggestionBlock = c.suggestion ? `\n\n\`\`\`suggestion\n${c.suggestion}\n\`\`\`` : "";
+    const bullet = `• ${path}${c.line ? ` (added line #${c.line})` : ""}\n${c.body}${suggestionBlock}`;
+    fallbackSnippets.push(bullet);
 
     if (pos) {
-      reviewComments.push({ path: c.path, position: pos, body });
-    } else {
-      overflowAsIssueLines.push(`• ${c.path}${c.line ? `:${c.line}` : ""} — ${c.body}${c.suggestion ? `\n\nSuggestion:\n\`\`\`\n${c.suggestion}\n\`\`\`` : ""}`);
+      inlineComments.push({
+        path,
+        position: pos, // absolute position in the file's unified diff
+        body: c.body + suggestionBlock,
+      });
     }
   }
 
-  // Post positioned comments
-  if (reviewComments.length) {
-    await octokit.pulls.createReview({
-      owner, repo, pull_number,
-      event: "COMMENT",
-      body: `Automated review for ${headSha.slice(0, 7)}.`,
-      comments: reviewComments
-    });
+  // Try to post inline review; if it fails with 422, fall back to a single issue comment
+  let inlinePosted = false;
+  if (inlineComments.length) {
+    try {
+      await octokit.pulls.createReview({
+        owner, repo, pull_number,
+        event: "COMMENT",
+        body: `Automated review for ${headSha.slice(0, 7)}.`,
+        comments: inlineComments
+      });
+      inlinePosted = true;
+    } catch (e) {
+      if (e?.status === 422) {
+        console.warn("Inline review rejected (422). Falling back to issue comment.");
+      } else {
+        console.warn("Inline review failed; falling back to issue comment.", e?.message || e);
+      }
+    }
   }
 
-  // Post overflow comments as a single issue comment
-  if (overflowAsIssueLines.length) {
+  if (!inlinePosted && fallbackSnippets.length) {
+    const body = [
+      `Unable to anchor inline comments to the diff (likely a diff context mismatch or truncated patch).`,
+      `Here’s the review as a single comment instead:\n`,
+      fallbackSnippets.join("\n\n")
+    ].join("\n");
     await octokit.issues.createComment({
-      owner, repo, issue_number: pull_number,
-      body: `Some comments could not be anchored to the diff and are listed here:\n\n${overflowAsIssueLines.join("\n\n")}`
+      owner, repo, issue_number: pull_number, body
     });
   }
 
@@ -385,7 +406,7 @@ async function main() {
 
     await octokit.issues.createComment({
       owner, repo, issue_number: pull_number,
-      body: "Pushed proposed tests/docs to the PR branch"
+      body: "Pushed proposed tests/docs to the PR branch."
     });
   }
 
