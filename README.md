@@ -1,7 +1,8 @@
-### New Functions
+## New Functions
 
-- `clamp(x, min, max)`: Clamps `x` between `min` and `max`. Throws an error if `min` is greater than `max`.
-- `div(a, b)`: Divides `a` by `b`. Throws an error if `b` is zero.
-- `isPalindrome(s)`: Checks if `s` is a palindrome.
-- `safeJsonParse(s, fallback)`: Safely parses JSON, returning `fallback` on error.
-- `kebabToCamel(s)`: Converts kebab-case strings to camelCase.
+- **sub(a, b)**: Returns the difference of a and b.
+- **clamp(x, min, max)**: Clamps x between min and max values.
+- **div(a, b)**: Returns the division of a by b, throws an error if b is zero.
+- **isPalindrome(s)**: Checks if a string is a palindrome.
+- **safeJsonParse(s, fallback)**: Safely parses JSON, returns fallback on error.
+- **kebabToCamel(s)**: Converts kebab-case string to camelCase.
